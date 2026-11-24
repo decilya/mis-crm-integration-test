@@ -1,1 +1,454 @@
-# mis-crm-integration-test
+# Интеграция МИС -> CRM: архитектурный разбор
+
+## Исходное тестовое задание (оригинал)
+
+**Контекст:** Интеграция МИС с amoCRM/Bitrix24. Разделена на две части:
+- 1-я часть: интеграция с МИС (API + скрипты на серверах клиник), отдаёт унифицированные данные во 2-ю часть
+- 2-я часть: обработка пришедших данных и загрузка в CRM
+
+**Речь только про 2-ю часть.**
+
+**Входные данные:**
+От МИС получаем на наш сервер строку в **нашей БД**, содержащую:
+- id клиники
+- id action (уникальный идентификатор действия)
+- тело изменившихся данных в полном виде
+- action: add/update/delete
+
+**Пример для пациента:** ФИО, дата рождения, пол, медкарта, дата следующего и прошлого визита
+
+**Сущности (как минимум):** услуга, пациент, визит, оплата
+
+**Задача:** С какими основными трудностями столкнёмся при организации загрузки данных в CRM?
+
+**Важно:** Выполнение на 100% невозможно и не ожидается.
+
+---
+
+## Основные трудности и решения
+
+### 1. Обнаружение новых строк и извлечение идентификатора
+
+**Трудность:** Данные уже лежат в нашей БД (часть 1 их туда положила). Нужно обнаружить новые строки, распознать тип сущности и извлечь идентификатор, которого нет в явном виде в payload.
+
+**Решение:**
+- **Обнаружение новых строк:** Периодическое чтение нашей БД со сравнением составного курсора как пары (timestamp, id). Таблица `INGEST_CURSOR` хранит составной курсор `(last_processed_created_at, last_processed_id)` по каждой клинике. Каждые 5 секунд выбираем строки по условию `WHERE (created_at, id) > (last_created_at, last_id) ORDER BY created_at, id LIMIT 100`. Это защищает от состояния гонки при пакетных вставках и транзакциях с одинаковым timestamp.
+- **Определение типа сущности:** Предполагаем, что часть 1 добавила поле `entity_type` в строку (требуется уточнение). Если нет — определяем по структуре payload через таблицу правил.
+- **Извлечение идентификатора:** Таблица `ENTITY_IDENTIFICATION` хранит правила для каждого типа сущности:
+    - Пациент: `medical_card` (медкарта как естественный ключ) + `fio` + `birth_date` для проверки
+    - Визит: составной ключ `patient_medical_card + visit_date + service_code`, хранится в `entity_id_json` как JSON с валидацией по JSON Schema (стандарт описания структуры JSON-документов)
+    - Услуга: `service_code` или `service_name` (справочник)
+    - Оплата: `payment_receipt_number` (номер чека) или `payment_external_id`
+
+Если в payload отсутствует нужный идентификатор — событие уходит в карантин с алертом "невозможно определить сущность". Производные поля (даты следующего/прошлого визита) в идентификации не участвуют.
+
+### 2. Атомарность: БД и очередь не должны расходиться
+
+**Трудность:** Если мы сохранили событие в БД, но упали до публикации в очередь — событие потеряно. Если опубликовали в очередь, но не сохранили в БД — получаем фантомное сообщение.
+
+**Решение:** Паттерн "исходящий буфер" (transactional outbox):
+1. В одной транзакции делаем INSERT в `MIS_EVENTS` и INSERT в `OUTBOX` (сообщение для очереди).
+2. Отдельный издатель читает `OUTBOX` и публикует сообщения в RabbitMQ.
+3. После получения подтверждения от RabbitMQ (publisher confirms) помечаем строку outbox как отправленную.
+
+Если издатель упал после публикации, но до подтверждения — при перезапуске он опубликует повторно. Идемпотентность на уровне `action_id` защитит CRM от дублей записей. Дубли в очереди допустимы, метрика "дубли в очереди" отслеживается для обнаружения проблем.
+
+### 3. Идемпотентность на двух уровнях
+
+**Трудность:** Защита от дублей двух типов:
+- Технические дубли (тот же `id action` пришёл дважды)
+- Бизнес-дубли (одна оплата пришла дважды с разными `id action`)
+
+**Решение:**
+- **Уровень 1 (id action):** Уникальный индекс на `(clinic_id, action_id)` в таблице `MIS_EVENTS`.
+- **Уровень 2 (окно дедупликации для оплат):** Таблица `PAYMENT_DEDUP_WINDOW` с полями:
+    - `clinic_id`
+    - `patient_medical_card` (естественный ключ пациента)
+    - `amount` (сумма)
+    - `created_at` (время события)
+
+  Перед созданием оплаты проверяем: если за последний час для этого пациента уже была оплата с суммой в пределах ±5% и временем в пределах ±5 минут, блокируем создание, помечаем `requires_review=true`, создаём алерт для ручной проверки.
+
+### 4. Сохранение порядка событий
+
+**Трудность:** События могут приходить в произвольном порядке (update раньше add). RabbitMQ не умеет парсить JSON payload на уровне exchange.
+
+**Решение:**
+1. **Ingest парсит payload** и сразу публикует в RabbitMQ exchange `entity_queues` типа consistent-hash (согласованное хеширование — распределение сообщений по очередям на основе хеша routing key) с routing key `clinic_id:entity_type:entity_id`.
+2. **Processing:** Consistent-hash exchange распределяет сообщения по N очередям так, что все события одной сущности попадают в одну очередь. Каждая очередь имеет единственного активного потребителя (single active consumer — только один потребитель активен в каждый момент времени), предварительная выборка = 1, обработка строго последовательная.
+
+Если consistent-hash недоступен (нет плагина) — резервный вариант: отдельные очереди на каждую клинику + внутри клиники consistent-hash по `entity_type:entity_id`.
+
+### 5. Обработка ошибок и повторные попытки
+
+**Трудность:** Временные сбои (сеть, CRM недоступна) не должны приводить к потере данных.
+
+**Решение:**
+- **Экспоненциальная задержка со случайным разбросом:** Задержка между попытками растёт (1s, 2s, 4s, 8s...) со случайным разбросом (±20%) для предотвращения эффекта толпы.
+- **Автоматический выключатель:** Если 50% проверок в сверке выявили расхождения — останавливаем сверку, создаём алерт "массовое расхождение, требуется ручной анализ".
+- **Очередь недоставленных сообщений (DLQ):** После N попыток (например, 5) сообщение уходит в DLQ с алертом для ручного разбора.
+
+### 6. Первичная загрузка истории
+
+**Трудность:** При подключении новой клиники нужно загрузить исторические данные без блокировки текущей обработки.
+
+**Решение:**
+- **Импорт из CSV:** Выгружаем историю из МИС в CSV, загружаем в CRM через пакетный импорт (обходит rate limits).
+- **Параллельная обработка:** Инкрементальная обработка продолжается во время загрузки.
+- **Стратегия разрешения конфликтов:** CSV создаёт записи со статусом `csv_imported` (импортирован из CSV) в `ENTITY_LINKS`. Инкремент при обнаружении такой записи выполняет полное обновление (объединение всех полей), а не отклонение. После успешного обновления статус меняется на `linked` (связан).
+
+Если CSV недоступен — используем обычный обработчик (медленнее, но работает).
+
+### 7. Сверка данных
+
+**Трудность:** Со временем данные в МИС и CRM могут расходиться.
+
+**Решение:**
+- **Ежесуточная сверка:** Раз в сутки (ночью):
+    1. Читаем записи из **таблиц состояния** (`PATIENTS`, `VISITS`, `PAYMENTS`, `SERVICES`) с `link_status = 'linked'` (связан) в `ENTITY_LINKS` (только те, что уже синхронизированы с CRM)
+    2. Для каждой записи проверяем наличие в CRM по entity_id
+    3. Сравниваем поля (суммы, даты, статусы)
+    4. Расхождения логируем в отчёт
+- **Стратифицированная выборка:** Если объём >100k записей:
+    - Минимум 50 записей на клинику (статистически значимо)
+    - Принудительная проверка клиник с задержкой обработки > 60s
+    - Потолок: не более 1000 проверок за цикл (если все клиники проблемные — проверяем 10 клиник с наибольшим объёмом)
+- **Автоматический выключатель:** Если >50% проверок выявили расхождения — останавливаем сверку, алерт.
+- **Таймаут:** 23 часа. Если сверка не уложилась — алерт и принудительное завершение.
+
+### 8. Обработка незавершённых записей
+
+**Трудность:** При сбое во время создания записи в CRM может остаться "незавершённая" запись (статус `creating` — создаётся).
+
+**Решение:**
+- **Срок действия метки аренды (lease_expires_at — время истечения аренды):** При создании ставим метку аренды (now() + 5 минут).
+- **Процесс очистки:** Каждые 30 секунд ищем записи со статусом `creating` и истёкшей меткой.
+- **Судьба записи:**
+    - Если срок истёк и нет связанных записей — удаляем с логированием
+    - Если есть связанные записи — помечаем как `orphan` (сирота) для ручного разбора
+- **SLA:** Оповещение дежурному инженеру, реакция в течение 4 часов.
+
+### 9. Управление конфигурацией
+
+**Трудность:** Для каждой клиники свои настройки (CRM-система, маппинг полей, rate limits).
+
+**Решение:**
+- **Таблица конфигурации:** `CLINICS` хранит настройки (crm_type, rate_limit, field_mapping).
+- **Кэш:** Настройки кэшируются в памяти (TTL 5 минут). При изменении — сброс кэша через Redis pub/sub.
+- **Резервный вариант для Redis:** Если Redis недоступен, кэш сбрасывается по TTL. Кнопка ручного сброса в админке.
+- **RBAC (управление доступом на основе ролей):** Доступ к админке ограничен ролью `admin`.
+
+### 10. Обработка ручных правок в CRM
+
+**Трудность:** Пользователь может вручную изменить данные в CRM. При следующей синхронизации МИС перезапишет эти правки.
+
+**Решение:**
+- **Таблица принадлежности полей:** `FIELD_OWNERSHIP` определяет, какие поля принадлежат МИС (перезаписываются), а какие — CRM (не перезаписываются).
+- **Консервативная стратегия (по умолчанию):** Все поля принадлежат МИС. Ручные правки в CRM запрещены до согласования с бизнесом.
+- **Миграция при согласовании:**
+    1. Сравниваем текущее значение в МИС с историей ручных правок в CRM (если CRM хранит аудит).
+    2. Если CRM не хранит аудит, используем метку времени последнего изменения (более позднее побеждает).
+    3. Конфликтующие записи помечаем для ручного разбора.
+
+### 11. Производные поля в payload
+
+**Трудность:** В примере payload для пациента упомянуты "дата следующего и прошлого визита" — это производные поля, которые меняются при каждом изменении визита.
+
+**Решение:**
+- **Не храним производные поля** в таблицах состояния как авторитетные данные.
+- **При обновлении пациента** игнорируем эти поля в payload.
+- **В CRM передаём производные даты** как срез на момент синхронизации (вычисляем из таблицы визитов).
+
+---
+
+## Модель данных (ER-диаграмма)
+
+```mermaid
+erDiagram
+    CLINICS ||--o{ MIS_EVENTS : "имеет"
+    CLINICS ||--o{ ENTITY_LINKS : "имеет"
+    CLINICS ||--o{ FIELD_OWNERSHIP : "имеет"
+    CLINICS ||--o{ PAYMENT_DEDUP_WINDOW : "имеет"
+    CLINICS ||--o{ ENTITY_IDENTIFICATION : "имеет"
+    CLINICS ||--o{ INGEST_CURSOR : "имеет"
+    CLINICS ||--o{ OUTBOX : "имеет"
+    CLINICS ||--o{ PATIENTS : "имеет"
+    CLINICS ||--o{ VISITS : "имеет"
+    CLINICS ||--o{ SERVICES : "имеет"
+    CLINICS ||--o{ PAYMENTS : "имеет"
+
+    CLINICS {
+        bigint id PK
+        string name
+        string crm_type "bitrix24|amocrm"
+        int rate_limit
+        jsonb field_mapping
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    INGEST_CURSOR {
+        bigint id PK
+        bigint clinic_id FK
+        timestamp last_processed_created_at "составной курсор: метка времени"
+        bigint last_processed_id "составной курсор: id"
+        timestamp updated_at
+    }
+
+    MIS_EVENTS {
+        bigint id PK
+        bigint clinic_id FK
+        string action_id UK "уникальный id действия из ТЗ"
+        jsonb payload "тело из ТЗ"
+        string entity_type "извлечён из payload"
+        string entity_id "извлечён по правилам"
+        string action "add|update|delete"
+        string status "pending|processing|processed|failed"
+        int attempts
+        timestamp created_at
+        timestamp processed_at
+    }
+
+    OUTBOX {
+        bigint id PK
+        bigint clinic_id FK
+        bigint event_id FK
+        string routing_key "clinic_id:entity_type:entity_id"
+        string status "pending|sent"
+        timestamp created_at
+        timestamp sent_at
+    }
+
+    ENTITY_LINKS {
+        bigint id PK
+        bigint clinic_id FK
+        string entity_type
+        string entity_id "извлечён по правилам"
+        string crm_entity_id
+        string link_status "creating|csv_imported|linked|orphan"
+        timestamp lease_expires_at "время истечения аренды"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    FIELD_OWNERSHIP {
+        bigint id PK
+        bigint clinic_id FK
+        string entity_type
+        string field_name
+        string owner "mis|crm"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PAYMENT_DEDUP_WINDOW {
+        bigint id PK
+        bigint clinic_id FK
+        string patient_medical_card "естественный ключ"
+        numeric amount "сумма оплаты"
+        timestamp created_at "время события"
+        boolean requires_review
+    }
+
+    ENTITY_IDENTIFICATION {
+        bigint id PK
+        bigint clinic_id FK
+        string entity_type
+        jsonb identification_rules "правила извлечения entity_id"
+        jsonb validation_schema "JSON Schema для валидации"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PATIENTS {
+        bigint id PK
+        bigint clinic_id FK
+        string medical_card UK "естественный ключ"
+        string fio
+        date birth_date
+        string gender
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    VISITS {
+        bigint id PK
+        bigint clinic_id FK
+        bigint patient_id FK
+        jsonb entity_id_json "составной ключ с валидацией"
+        timestamp visit_date
+        string status
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    SERVICES {
+        bigint id PK
+        bigint clinic_id FK
+        string service_code UK
+        string name
+        numeric price
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PAYMENTS {
+        bigint id PK
+        bigint clinic_id FK
+        bigint patient_id FK
+        bigint visit_id FK
+        string payment_receipt_number UK "номер чека"
+        numeric amount
+        timestamp payment_date
+        string status
+        timestamp created_at
+        timestamp updated_at
+    }
+```
+
+---
+
+## Архитектура компонентов
+
+```mermaid
+graph LR
+    OUR_DB[(Наша БД<br/>строки от части 1)] -->|периодическое чтение<br/>сравнение составного курсора| Ingest[Ingest Service]
+    Ingest -->|TX: INSERT + OUTBOX| MIS_EVENTS
+    Ingest -->|TX: INSERT + OUTBOX| OUTBOX
+
+    OutboxPublisher[Издатель исходящего буфера] -->|read| OUTBOX
+    OutboxPublisher -->|publish + подтверждение| RMQ[RabbitMQ<br/>entity_queues<br/>consistent-hash]
+    OutboxPublisher -->|mark sent| OUTBOX
+
+    RMQ -->|consistent-hash| Q1[Queue 1]
+    RMQ -->|consistent-hash| Q2[Queue 2]
+    RMQ -->|consistent-hash| Q3[Queue N]
+
+    Q1 --> Processor1[Processor 1<br/>единственный активный потребитель<br/>предварительная выборка = 1]
+    Q2 --> Processor2[Processor 2]
+    Q3 --> Processor3[Processor N]
+
+    Processor1 -->|read| MIS_EVENTS
+    Processor1 -->|TX: UPDATE| StateDB[Таблицы состояния + ENTITY_LINKS]
+    Processor1 -->|API call вне TX| CRM[Bitrix24/amoCRM]
+
+    Processor1 -.->|повторная попытка| DelayedExchange[delayed-message exchange]
+    DelayedExchange -.->|после задержки| LowPriorityQueue[низкоприоритетная очередь]
+    LowPriorityQueue -.->|повторная публикация| RMQ
+
+    subgraph Фоновые задачи
+        Reconciler[Задача сверки]
+        Cleanup[Задача очистки]
+    end
+
+    Reconciler -->|read только linked| StateDB
+    Reconciler -->|API call| CRM
+    Cleanup -->|UPDATE| ENTITY_LINKS
+```
+
+---
+
+## Жизненный цикл события
+
+```mermaid
+sequenceDiagram
+    participant OUR_DB as Наша БД
+    participant Ingest
+    participant DB as MIS_EVENTS
+    participant OB as OUTBOX
+    participant Publisher as Издатель исходящего буфера
+    participant RMQ as entity_queues
+    participant Processor
+    participant StateDB as Таблицы состояния + ENTITY_LINKS
+    participant CRM
+
+    OUR_DB->>Ingest: чтение строк WHERE (created_at, id) > (last_created_at, last_id)
+    Note over Ingest: парсинг payload,<br/>извлечение entity_type и entity_id,<br/>валидация JSON Schema для составных ключей
+    Ingest->>DB: TX: INSERT в MIS_EVENTS
+    Ingest->>OB: TX: INSERT в OUTBOX (routing_key=clinic_id:entity_type:entity_id)
+    Ingest->>OUR_DB: обновление составного курсора
+
+    Publisher->>OB: чтение pending сообщений
+    Publisher->>RMQ: publish (routing_key, message=action_id)
+    RMQ-->>Publisher: подтверждение издателя
+    Publisher->>OB: mark sent
+
+    RMQ->>Processor: consume (action_id)
+    Processor->>DB: SELECT * WHERE action_id=? FOR UPDATE SKIP LOCKED
+    Processor->>DB: UPDATE status=processing
+    Processor->>CRM: API call (create/update/delete entity)
+
+    alt Успех
+        CRM-->>Processor: 200 OK (crm_entity_id)
+        Processor->>StateDB: TX: UPDATE таблиц состояния + INSERT/UPDATE ENTITY_LINKS (crm_entity_id, link_status=linked)
+        Processor->>DB: UPDATE status=processed
+        Processor->>RMQ: ack
+    else Повторная попытка
+        CRM-->>Processor: 5xx/timeout
+        Processor->>DB: UPDATE attempts=attempts+1, status=pending
+        Processor->>RMQ: nack (requeue=false)
+        Processor->>RMQ: publish to очередь недоставленных
+    else Очередь недоставленных
+        Processor->>DB: UPDATE status=failed
+        Processor->>RMQ: nack (requeue=false)
+        Processor->>RMQ: publish to очередь недоставленных
+    end
+```
+
+---
+
+## Резервные варианты
+
+**Consistent-hash exchange требует плагина RabbitMQ.** Если плагин недоступен:
+- Отдельные очереди на каждую клинику с прямым роутингом
+- Внутри клиники consistent-hash по `entity_type:entity_id`
+- Задержки через отдельные очереди на каждый шаг (30 сек, 1 мин, 5 мин) с TTL и резервным exchange обратно в основную очередь
+
+**Redis недоступен для кэша настроек:**
+- Кэш сбрасывается по TTL (каждые 5 минут)
+- Кнопка ручного сброса в админке
+
+**Импорт из CSV недоступен для первичной загрузки:**
+- Используем обычный обработчик событий (медленнее, но работает)
+
+**Часть 1 не добавляет entity_type в строку:**
+- Определяем тип сущности по структуре payload через таблицу правил `ENTITY_IDENTIFICATION`
+- Риск: неоднозначное определение для некоторых payload
+
+---
+
+## Вопросы для уточнения
+
+1. **Объём исторических данных:** Какой объём нужно загрузить при подключении новой клиники? (10k, 100k, 1M записей)
+2. **SLA для обработки:** Какой SLA для обработки событий? (99% за 1 минуту, 99.9% за 5 минут)
+3. **Мониторинг:** Какие системы мониторинга используются? (Prometheus, Datadog)
+4. **Deployment:** Как развёртывается сервис? (Kubernetes, Docker Compose)
+5. **Метаданные от части 1:** Добавляет ли часть 1 поле `entity_type` в строку, которую кладёт в нашу БД? Или мы должны определять тип сущности по структуре payload?
+6. **Медкарта как ключ пациента:** Корректно ли использовать номер медкарты как естественный ключ для пациента, или есть более стабильный идентификатор?
+7. **Идентификаторы для других сущностей:** Какие поля в payload являются идентификаторами для визита, услуги, оплаты?
+8. **Уникальность id action:** Гарантирует ли МИС, что `id action` уникален в рамках клиники навсегда, или возможны повторные использования?
+
+---
+
+## Заключение
+
+Основные трудности интеграции (в контексте оригинального ТЗ):
+
+1. **Обнаружение новых строк и извлечение идентификатора** — сравнение составного курсора (метка времени, id) для защиты от состояния гонки, таблица `ENTITY_IDENTIFICATION` с правилами и JSON Schema валидацией для каждого типа сущности, медкарта как естественный ключ для пациента
+2. **Атомарность между БД и очередью** — паттерн "исходящий буфер" (transactional outbox) + подтверждения издателя от RabbitMQ
+3. **Идемпотентность** — двухуровневая защита (action_id + окно дедупликации с fuzzy matching)
+4. **Порядок событий** — consistent-hash exchange (согласованное хеширование) на извлечённых entity_type:entity_id, единственные активные потребители с предварительной выборкой = 1
+5. **Обработка ошибок** — экспоненциальная задержка + разброс + автоматический выключатель + очередь недоставленных сообщений
+6. **Первичная загрузка** — импорт из CSV + параллельная обработка + стратегия разрешения конфликтов
+7. **Сверка данных** — ежесуточная сверка по таблицам состояния с `link_status = 'linked'` (связан) + стратифицированная выборка с минимумом 50 записей + автоматический выключатель + таймаут 23 часа
+8. **Незавершённые записи** — срок аренды (lease_expires_at) + процесс очистки + проверка связанных записей + SLA
+9. **Конфигурация** — таблица настроек + кэш + резервный вариант для Redis + RBAC (управление доступом на основе ролей)
+10. **Ручные правки** — таблица принадлежности полей + консервативная стратегия + миграция
+11. **Производные поля** — не храним как авторитетные, вычисляем из таблицы визитов
+
+Все решения строго соответствуют оригинальному ТЗ:
+- Читаем из **нашей БД** (куда часть 1 положила данные), а не опрашиваем БД МИС
+- Атомарность обеспечена паттерном outbox + подтверждения издателя + транзакционное обновление таблиц состояния и ENTITY_LINKS
+- Извлекаем идентификаторы из payload по правилам с JSON Schema валидацией
+- Сравнение составного курсора защищает от состояния гонки
+- Сверка работает только по синхронизированным записям (`link_status = 'linked'`)
