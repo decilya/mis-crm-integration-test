@@ -132,6 +132,7 @@
     - Если срок истёк и связанных записей нет — удаляем связь с логированием причины
     - Если связанные записи есть — помечаем как `orphan` (сирота) для ручного разбора
 - **SLA:** Оповещение дежурному инженеру, реакция в течение 4 часов.
+-  **Зависимости между сущностями:** если дочерняя запись (оплата, визит) приходит раньше родительской (пациент, услуга), в CRM её создать не с чем. Ставим связь в статус `creating` без `crm_entity_id`, дочернее событие откладываем в низкоприоритетную очередь; когда приходит событие родителя и связь становится `linked`, дочернее событие перечитывается и обрабатывается. Если родитель так и не пришёл — срабатывает срок аренды из этого же раздела.
 
 ### 9. Управление конфигурацией
 
@@ -165,22 +166,18 @@
 - **В CRM передаём производные даты** как срез на момент синхронизации (вычисляем из таблицы визитов).
 
 ---
-
-## Модель данных (ER-диаграмма)
+## Модель данных: служебные таблицы
 
 ```mermaid
 erDiagram
     CLINICS ||--o{ MIS_EVENTS : "имеет"
+    CLINICS ||--o{ OUTBOX : "имеет"
     CLINICS ||--o{ ENTITY_LINKS : "имеет"
+    CLINICS ||--o{ INGEST_CURSOR : "имеет"
+    CLINICS ||--o{ ENTITY_IDENTIFICATION : "имеет"
     CLINICS ||--o{ FIELD_OWNERSHIP : "имеет"
     CLINICS ||--o{ PAYMENT_DEDUP_WINDOW : "имеет"
-    CLINICS ||--o{ ENTITY_IDENTIFICATION : "имеет"
-    CLINICS ||--o{ INGEST_CURSOR : "имеет"
-    CLINICS ||--o{ OUTBOX : "имеет"
-    CLINICS ||--o{ PATIENTS : "имеет"
-    CLINICS ||--o{ VISITS : "имеет"
-    CLINICS ||--o{ SERVICES : "имеет"
-    CLINICS ||--o{ PAYMENTS : "имеет"
+    MIS_EVENTS ||--o{ OUTBOX : "порождает"
 
     CLINICS {
         bigint id PK
@@ -236,6 +233,16 @@ erDiagram
         timestamp updated_at
     }
 
+    ENTITY_IDENTIFICATION {
+        bigint id PK
+        bigint clinic_id FK
+        string entity_type
+        jsonb identification_rules "правила извлечения entity_id"
+        jsonb validation_schema "JSON Schema для валидации"
+        timestamp created_at
+        timestamp updated_at
+    }
+
     FIELD_OWNERSHIP {
         bigint id PK
         bigint clinic_id FK
@@ -254,15 +261,23 @@ erDiagram
         timestamp created_at "время события"
         boolean requires_review
     }
+```
 
-    ENTITY_IDENTIFICATION {
+## Модель данных: таблицы состояния
+
+```mermaid
+erDiagram
+    CLINICS ||--o{ PATIENTS : "имеет"
+    CLINICS ||--o{ SERVICES : "имеет"
+    PATIENTS ||--o{ VISITS : "имеет"
+    PATIENTS ||--o{ PAYMENTS : "имеет"
+    VISITS ||--o{ PAYMENTS : "оплачивается"
+    SERVICES ||--o{ VISITS : "входит в"
+
+    CLINICS {
         bigint id PK
-        bigint clinic_id FK
-        string entity_type
-        jsonb identification_rules "правила извлечения entity_id"
-        jsonb validation_schema "JSON Schema для валидации"
-        timestamp created_at
-        timestamp updated_at
+        string name
+        string crm_type "bitrix24|amocrm"
     }
 
     PATIENTS {
@@ -311,98 +326,91 @@ erDiagram
     }
 ```
 
----
-
-## Архитектура компонентов
+## Архитектура: основной конвейер
 
 ```mermaid
-graph LR
-    OUR_DB[(Наша БД<br/>строки от части 1)] -->|периодическое чтение<br/>сравнение составного курсора| Ingest[Ingest Service]
-    Ingest -->|TX: INSERT + OUTBOX| MIS_EVENTS
-    Ingest -->|TX: INSERT + OUTBOX| OUTBOX
-
-    OutboxPublisher[Издатель исходящего буфера] -->|read| OUTBOX
-    OutboxPublisher -->|publish + подтверждение| RMQ[RabbitMQ<br/>entity_queues<br/>consistent-hash]
-    OutboxPublisher -->|mark sent| OUTBOX
-
-    RMQ -->|consistent-hash| Q1[Queue 1]
-    RMQ -->|consistent-hash| Q2[Queue 2]
-    RMQ -->|consistent-hash| Q3[Queue N]
-
-    Q1 --> Processor1[Processor 1<br/>единственный активный потребитель<br/>предварительная выборка = 1]
-    Q2 --> Processor2[Processor 2]
-    Q3 --> Processor3[Processor N]
-
-    Processor1 -->|read| MIS_EVENTS
-    Processor1 -->|TX: UPDATE| StateDB[Таблицы состояния + ENTITY_LINKS]
-    Processor1 -->|API call вне TX| CRM[Bitrix24/amoCRM]
-
-    Processor1 -.->|повторная попытка| DelayedExchange[delayed-message exchange]
-    DelayedExchange -.->|после задержки| LowPriorityQueue[низкоприоритетная очередь]
-    LowPriorityQueue -.->|повторная публикация| RMQ
-
-    subgraph Фоновые задачи
-        Reconciler[Задача сверки]
-        Cleanup[Задача очистки]
-        Archiver[Задача архивации журналов]
-    end
-
-    Reconciler -->|read только linked| StateDB
-    Reconciler -->|API call| CRM
-    Cleanup -->|UPDATE| ENTITY_LINKS
-    Archiver -->|архив старше 30 дней| MIS_EVENTS
-    Archiver -->|архив старше 30 дней| OUTBOX
+flowchart LR
+    OUR_DB[(Наша БД:<br/>строки от части 1)] -->|чтение по курсору| INGEST[Ingest]
+    INGEST -->|TX: INSERT| EV[(MIS_EVENTS)]
+    INGEST -->|TX: INSERT| OB[(OUTBOX)]
+    OB -->|чтение pending| PUB[Издатель буфера]
+    PUB -->|publish + подтверждение| RMQ{RabbitMQ entity_queues<br/>consistent-hash}
+    PUB -->|mark sent| OB
+    RMQ -->|consistent-hash| Q1[Очередь 1<br/>один активный потребитель<br/>предварительная выборка = 1]
+    RMQ -->|consistent-hash| QN[Очередь N<br/>один активный потребитель<br/>предварительная выборка = 1]
+    Q1 --> P1[Processor 1]
+    QN --> PN[Processor N]
+    P1 -->|чтение события| EV
+    P1 -->|TX: состояние + связь linked| ST[(Таблицы состояния<br/>+ ENTITY_LINKS)]
+    P1 -->|вызов вне TX| CRM[Bitrix24/amoCRM]
+    P1 -.->|повтор| DELAY[delayed-message exchange]
+    DELAY -.->|после задержки| LPQ[низкоприоритетная очередь]
+    LPQ -.->|повторная публикация| RMQ
 ```
 
----
+## Архитектура: фоновые задачи
+
+```mermaid
+flowchart LR
+    REC[Задача сверки] -->|linked и updated_at за сутки| ST[(Таблицы состояния<br/>+ ENTITY_LINKS)]
+    REC -->|linked, все записи раз в неделю| ST
+    REC -->|выборочная проверка по crm_entity_id| CRM[Bitrix24/amoCRM]
+    CLEAN[Задача очистки] -->|сброс истёкшей аренды| ST
+    ARCH[Задача архивации] -->|архив старше 30 дней| EV[(MIS_EVENTS)]
+    ARCH -->|архив старше 30 дней| OB[(OUTBOX)]
+```
 
 ## Жизненный цикл события
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant OUR_DB as Наша БД
     participant Ingest
-    participant DB as MIS_EVENTS
+    participant EV as MIS_EVENTS
     participant OB as OUTBOX
-    participant Publisher as Издатель исходящего буфера
+    participant PUB as Издатель буфера
     participant RMQ as entity_queues
-    participant Processor
-    participant StateDB as Таблицы состояния + ENTITY_LINKS
-    participant CRM
+    participant PROC as Processor
+    participant CRM as Bitrix24/amoCRM
+    participant ST as Таблицы состояния + ENTITY_LINKS
 
-    OUR_DB->>Ingest: чтение строк WHERE (created_at, id) > (last_processed_created_at, last_processed_id)
-    Note over Ingest: парсинг payload,<br/>извлечение entity_type и entity_id,<br/>валидация JSON Schema для составных ключей
-    Ingest->>DB: TX: INSERT в MIS_EVENTS
-    Ingest->>OB: TX: INSERT в OUTBOX (routing_key=clinic_id:entity_type:entity_id)
-    Ingest->>OUR_DB: обновление составного курсора
+    OUR_DB->>Ingest: строки WHERE (created_at, id) > курсор
+    Note over Ingest: парсинг payload,<br/>извлечение entity_type и entity_id,<br/>валидация JSON Schema
+    Ingest->>EV: TX: INSERT событие
+    Ingest->>OB: TX: INSERT сообщение (routing_key)
+    Ingest->>OUR_DB: обновление курсора
 
-    Publisher->>OB: чтение pending сообщений
-    Publisher->>RMQ: publish (routing_key, message=action_id)
-    RMQ-->>Publisher: подтверждение издателя
-    Publisher->>OB: mark sent
+    PUB->>OB: чтение pending
+    PUB->>RMQ: publish (routing_key, action_id)
+    RMQ-->>PUB: подтверждение издателя
+    PUB->>OB: mark sent
 
-    RMQ->>Processor: consume (action_id)
-    Processor->>DB: SELECT * WHERE action_id=? FOR UPDATE SKIP LOCKED
-    Processor->>DB: UPDATE status=processing
-    Processor->>CRM: API call (create/update/delete entity)
+    RMQ->>PROC: consume (action_id)
+    PROC->>EV: SELECT FOR UPDATE SKIP LOCKED,<br/>status=processing
+    PROC->>CRM: API call вне TX
 
-    alt Успех
-        CRM-->>Processor: 200 OK (crm_entity_id)
-        Processor->>StateDB: TX: UPDATE таблиц состояния + INSERT/UPDATE ENTITY_LINKS (crm_entity_id, link_status=linked)
-        Processor->>DB: UPDATE status=processed
-        Processor->>RMQ: ack
-    else Повторная попытка
-        CRM-->>Processor: 5xx/timeout
-        Processor->>DB: UPDATE attempts=attempts+1, status=pending
-        Processor->>RMQ: nack (requeue=false)
-        Processor->>RMQ: publish to delayed-message exchange
-    else Очередь недоставленных
-        Processor->>DB: UPDATE status=failed
-        Processor->>RMQ: nack (requeue=false)
-        Processor->>RMQ: publish to очередь недоставленных
+    rect rgb(35, 60, 35)
+    Note over PROC,CRM: Успех
+    CRM-->>PROC: 200 OK (crm_entity_id)
+    PROC->>ST: TX: состояние + связь linked
+    PROC->>EV: status=processed
+    PROC->>RMQ: ack
+    end
+
+    rect rgb(60, 55, 25)
+    Note over PROC,CRM: Повторная попытка: 5xx или timeout, попытки меньше N
+    CRM-->>PROC: 5xx или timeout
+    PROC->>EV: attempts+1, status=pending
+    PROC->>RMQ: nack и publish в delayed-message exchange
+    end
+
+    rect rgb(60, 30, 30)
+    Note over PROC,CRM: Попытки исчерпаны
+    PROC->>EV: status=failed
+    PROC->>RMQ: nack и publish в очередь недоставленных
     end
 ```
-
 ---
 
 ## Резервные варианты
